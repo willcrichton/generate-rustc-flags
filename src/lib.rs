@@ -21,6 +21,7 @@ struct Dependency {
 
 #[derive(Deserialize, Debug)]
 struct Unit {
+  pkg_id: String,
   target: Target,
   dependencies: Vec<Dependency>,
   features: Vec<String>,
@@ -83,6 +84,14 @@ fn gather_rmeta_paths() -> Result<HashMap<String, String>> {
 pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>> {
   let source_path = source_path.as_ref();
 
+  let sysroot = String::from_utf8(
+    Command::new("rustc")
+      .args(&["--print", "sysroot"])
+      .output()?
+      .stdout,
+  )?;
+  let sysroot = sysroot.trim().to_string();
+
   let graph = UnitGraph::run_cargo_and_build()?;
 
   let target_unit = graph.find_unit_containing(&source_path).context(format!(
@@ -92,14 +101,24 @@ pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>
 
   // Run cargo check to generate dependency rmetas
   {
-    let check = Command::new("cargo")
-      .args(&["check", "--package", &target_unit.target.name])
-      .output()?;
-    if !check.status.success() {
-      bail!(
-        "cargo check failed with error: {}",
-        String::from_utf8(check.stderr)?
-      );
+    for dependency in &target_unit.dependencies {
+      let dep_unit = &graph.units[dependency.index];
+      let mut pkg_parts = dep_unit.pkg_id.split(" ");
+      let pkg_name = pkg_parts.next().context("Missing name from pkg_id")?;
+      let pkg_version = pkg_parts.next().context("Missing version from pkg_id")?;
+      let check = Command::new("cargo")
+        .args(&[
+          "check",
+          "--package",
+          &format!("{}:{}", pkg_name, pkg_version),
+        ])
+        .output()?;
+      if !check.status.success() {
+        bail!(
+          "cargo check failed with error: {}",
+          String::from_utf8(check.stderr)?
+        );
+      }
     }
   }
 
@@ -113,6 +132,8 @@ pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>
 
     // TODO: what if there are multiple crate types?
     "--crate-type".into(), target_unit.target.crate_types[0].clone(),
+
+    "--sysroot".into(), sysroot,
 
     // Path must be the crate root file, NOT the sliced file
     target_unit.target.src_path.clone(),
