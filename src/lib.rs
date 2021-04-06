@@ -1,87 +1,21 @@
-use anyhow::{bail, Context, Result};
-use regex::Regex;
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use anyhow::{bail, Context as AnyhowContext, Result};
+use cargo::{
+  core::{
+    compiler::{build_map, extern_args, lto, CompileMode, Context, CrateType, UnitInterner},
+    Workspace,
+  },
+  ops::{create_bcx, CompileOptions, Packages},
+  util::config::Config,
+};
 use std::process::Command;
+use std::{collections::HashMap, path::Path};
 
-#[derive(Deserialize, Debug)]
-struct Target {
-  name: String,
-  crate_types: Vec<String>,
-  edition: String,
-  src_path: String,
-}
+pub use cargo::core::resolver::CliFeatures;
 
-#[derive(Deserialize, Debug)]
-struct Dependency {
-  index: usize,
-}
-
-#[derive(Deserialize, Debug)]
-struct Unit {
-  pkg_id: String,
-  target: Target,
-  dependencies: Vec<Dependency>,
-  features: Vec<String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct UnitGraph {
-  units: Vec<Unit>,
-  roots: Vec<usize>,
-}
-
-impl UnitGraph {
-  fn run_cargo_and_build() -> Result<Self> {
-    let cargo_output = Command::new("cargo")
-      .args(&["check", "--unit-graph", "-Z", "unstable-options"])
-      .output()?
-      .stdout;
-    Ok(serde_json::from_slice::<UnitGraph>(&cargo_output)?)
-  }
-
-  fn find_unit_containing(&self, source_path: &Path) -> Option<&Unit> {
-    self.units.iter().find(|unit| {
-      let src_path = Path::new(&unit.target.src_path);
-      match src_path.parent() {
-        Some(src_dir) => source_path.ancestors().any(|ancestor| ancestor == src_dir),
-        None => false,
-      }
-    })
-  }
-}
-
-fn gather_rmeta_paths() -> Result<HashMap<String, String>> {
-  let re = Regex::new(r"lib(.+)-[\w\d]+.rmeta")?;
-  Ok(
-    fs::read_dir("target/debug/deps")?
-      .map(|file| {
-        Ok({
-          let path = file?.path();
-          let path_str = path.to_str().context("Couldn't convert path")?;
-          if let Some(file_name) = path.file_name() {
-            let file_name = file_name.to_str().context("Couldn't convert file name")?;
-            re.captures(file_name).map(|capture| {
-              (
-                capture.get(1).unwrap().as_str().to_owned(),
-                path_str.to_owned(),
-              )
-            })
-          } else {
-            None
-          }
-        })
-      })
-      .collect::<Result<Vec<_>>>()?
-      .into_iter()
-      .filter_map(|x| x)
-      .collect::<HashMap<_, _>>(),
-  )
-}
-
-pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>> {
+pub fn generate_rustc_flags(
+  source_path: impl AsRef<Path>,
+  features: CliFeatures,
+) -> Result<(Vec<String>, HashMap<String, String>)> {
   let source_path = source_path.as_ref();
 
   let sysroot = String::from_utf8(
@@ -92,55 +26,68 @@ pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>
   )?;
   let sysroot = sysroot.trim().to_string();
 
-  let graph = UnitGraph::run_cargo_and_build()?;
+  let config = Config::default()?;
+  let manifest_path = Path::new("./Cargo.toml").canonicalize()?;
+  let workspace = Workspace::new(manifest_path.as_ref(), &config)?;
+  let mut compile_opts = CompileOptions::new(&config, CompileMode::Check { test: false })?;
+  compile_opts.spec = Packages::Default;
+  compile_opts.cli_features = features;
+  let interner = UnitInterner::new();
+  let bcx = create_bcx(&workspace, &compile_opts, &interner)?;
+  let mut cx = Context::new(&bcx)?;
 
-  let target_unit = graph.find_unit_containing(&source_path).context(format!(
-    "Could not find unit with source directory for {}",
-    source_path.display()
-  ))?;
+  cx.lto = lto::generate(&bcx)?;
+  cx.prepare_units()?;
+  cx.prepare()?;
+  build_map(&mut cx)?;
 
-  // Run cargo check to generate dependency rmetas
-  {
-    for dependency in &target_unit.dependencies {
-      let dep_unit = &graph.units[dependency.index];
-      let mut pkg_parts = dep_unit.pkg_id.split(" ");
-      let pkg_name = pkg_parts.next().context("Missing name from pkg_id")?;
-      let pkg_version = pkg_parts.next().context("Missing version from pkg_id")?;
-      let check = Command::new("cargo")
-        .args(&[
-          "check",
-          "--package",
-          &format!("{}:{}", pkg_name, pkg_version),
-        ])
-        .output()?;
-      if !check.status.success() {
-        bail!(
-          "cargo check failed with error: {}",
-          String::from_utf8(check.stderr)?
-        );
-      }
+  let target_unit = {
+    let matches = bcx
+      .roots
+      .iter()
+      .filter(|root| {
+        let unit_src_path = root.target.src_path().path().unwrap();
+        match unit_src_path.parent() {
+          Some(src_dir) => source_path.ancestors().any(|ancestor| ancestor == src_dir),
+          None => false,
+        }
+      })
+      .collect::<Vec<_>>();
+
+    match matches.len() {
+      0 => bail!("Could not find unit for path {}", source_path.display()),
+      1 => matches[0],
+      _ => matches
+        .into_iter()
+        .find(|unit| {
+          unit
+            .target
+            .rustc_crate_types()
+            .iter()
+            .any(|ty| *ty == CrateType::Lib)
+        })
+        .context("No lib target w/ multiple targets")?,
     }
-  }
+  };
 
-  let rmeta_paths = gather_rmeta_paths()?;
-
+  // TODO: generate these from build_base_args
   #[rustfmt::skip]
   let unit_flags = vec![
     "rustc".into(),    
     
-    "--crate-name".into(), target_unit.target.name.clone(),
+    "--crate-name".into(), target_unit.target.crate_name(),
 
     // TODO: what if there are multiple crate types?
-    "--crate-type".into(), target_unit.target.crate_types[0].clone(),
+    "--crate-type".into(), target_unit.target.kind().rustc_crate_types()[0].as_str().to_string(),
 
     "--sysroot".into(), sysroot,
 
     // Path must be the crate root file, NOT the sliced file
-    target_unit.target.src_path.clone(),
+    format!("{}", target_unit.target.src_path().path().unwrap().display()),
 
-    format!("--edition={}", target_unit.target.edition),
+    format!("--edition={}", target_unit.target.edition()),
 
-    "-L".into(), "dependency=target/debug/deps".into(),
+    "-L".into(), format!("{}", cx.files().layout(target_unit.kind).deps().display()),
 
     // Avoids ICE looking for MIR data?
     "--emit=dep-info,metadata".into(),
@@ -152,30 +99,35 @@ pub fn generate_rustc_flags(source_path: impl AsRef<Path>) -> Result<Vec<String>
     .map(|feature| vec!["--cfg".into(), format!("feature=\"{}\"", feature)])
     .flatten();
 
-  let extern_flags = target_unit
-    .dependencies
-    .iter()
-    .map(|dep| {
-      let dep_unit = &graph.units[dep.index];
+  let extern_flags = extern_args(&cx, target_unit, &mut false)?
+    .into_iter()
+    .map(|s| s.into_string().unwrap());
 
-      // packages like `percent-encoding` are translated to `percent_encoding`
-      let package_name = dep_unit.target.name.replace("-", "_");
+  let mut env = HashMap::new();
+  env.insert(
+    "CARGO_PKG_VERSION".into(),
+    target_unit.pkg.version().to_string(),
+  );
+  env.insert("CARGO_PKG_NAME".into(), target_unit.pkg.name().to_string());
 
-      let rmeta_path = &rmeta_paths
-        .get(&package_name)
-        .expect(&format!("Missing rmeta for `{}`", package_name));
+  // TODO: NOT WORKING
+  if let Some(target_meta) = cx.find_build_script_metadata(target_unit) {
+    if let Some(output) = cx.build_script_outputs.lock().unwrap().get(target_meta) {
+      // for cfg in output.cfgs.iter() {
+      //   rustdoc.arg("--cfg").arg(cfg);
+      // }
+      for &(ref name, ref value) in output.env.iter() {
+        env.insert(name.to_owned(), value.to_owned());
+      }
+    }
+  }
 
-      vec![
-        "--extern".into(),
-        format!("{}={}", package_name, rmeta_path),
-      ]
-    })
-    .flatten();
-  Ok(
+  Ok((
     unit_flags
       .into_iter()
       .chain(feature_flags)
       .chain(extern_flags)
       .collect(),
-  )
+    env,
+  ))
 }
