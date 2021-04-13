@@ -1,10 +1,10 @@
 use anyhow::{bail, Context as AnyhowContext, Result};
 use cargo::{
   core::{
-    compiler::{build_map, extern_args, lto, CompileMode, Context, CrateType, UnitInterner},
+    compiler::{build_map, extern_args, lto, CompileMode, Context, CrateType, Unit, UnitInterner},
     Workspace,
   },
-  ops::{create_bcx, CompileOptions, Packages},
+  ops::{create_bcx, CompileFilter, CompileOptions, FilterRule, LibRule, Packages},
   util::config::Config,
 };
 use std::process::Command;
@@ -12,9 +12,19 @@ use std::{collections::HashMap, path::Path};
 
 pub use cargo::core::resolver::CliFeatures;
 
+fn collect_units(cx: &Context, unit: &Unit) -> Vec<Unit> {
+  cx.unit_deps(unit)
+    .iter()
+    .map(|dep| collect_units(cx, &dep.unit).into_iter())
+    .flatten()
+    .chain(vec![unit.clone()].into_iter())
+    .collect()
+}
+
 pub fn generate_rustc_flags(
   source_path: impl AsRef<Path>,
   features: CliFeatures,
+  lib_only: bool,
 ) -> Result<(Vec<String>, HashMap<String, String>)> {
   let source_path = source_path.as_ref();
 
@@ -32,6 +42,18 @@ pub fn generate_rustc_flags(
   let mut compile_opts = CompileOptions::new(&config, CompileMode::Check { test: false })?;
   compile_opts.spec = Packages::Default;
   compile_opts.cli_features = features;
+
+  if lib_only {
+    compile_opts.filter = CompileFilter::Only {
+      all_targets: false,
+      lib: LibRule::Default,
+      bins: FilterRule::Just(vec![]),
+      examples: FilterRule::Just(vec![]),
+      tests: FilterRule::Just(vec![]),
+      benches: FilterRule::Just(vec![]),
+    };
+  }
+
   let interner = UnitInterner::new();
   let bcx = create_bcx(&workspace, &compile_opts, &interner)?;
   let mut cx = Context::new(&bcx)?;
@@ -41,9 +63,19 @@ pub fn generate_rustc_flags(
   cx.prepare()?;
   build_map(&mut cx)?;
 
+  let all_units = bcx
+    .roots
+    .iter()
+    .map(|root| collect_units(&cx, root).into_iter())
+    .flatten()
+    .collect::<Vec<_>>();
+
+  // let mut queue = JobQueue::new(&bcx);
+  // let mut plan = BuildPlan::new();
+  // compile(&mut cx, &mut queue, &mut plan, target_unit, exec, false)?;
+
   let target_unit = {
-    let matches = bcx
-      .roots
+    let matches = all_units
       .iter()
       .filter(|root| {
         let unit_src_path = root.target.src_path().path().unwrap();
@@ -109,10 +141,16 @@ pub fn generate_rustc_flags(
     target_unit.pkg.version().to_string(),
   );
   env.insert("CARGO_PKG_NAME".into(), target_unit.pkg.name().to_string());
+  env.insert(
+    "CARGO_MANIFEST_DIR".into(),
+    format!("{}", manifest_path.parent().unwrap().display()),
+  );
 
   // TODO: NOT WORKING
   if let Some(target_meta) = cx.find_build_script_metadata(target_unit) {
+    println!("A");
     if let Some(output) = cx.build_script_outputs.lock().unwrap().get(target_meta) {
+      println!("B");
       // for cfg in output.cfgs.iter() {
       //   rustdoc.arg("--cfg").arg(cfg);
       // }
