@@ -1,14 +1,22 @@
 use anyhow::{bail, Context as AnyhowContext, Result};
 use cargo::{
   core::{
-    compiler::{build_map, extern_args, lto, CompileMode, Context, CrateType, Unit, UnitInterner},
+    compiler::{
+      build_map, compile, extern_args, lto, BuildPlan, CompileMode, Context, CrateType,
+      DefaultExecutor, Executor, JobQueue, Unit, UnitInterner,
+    },
     Workspace,
   },
   ops::{create_bcx, CompileFilter, CompileOptions, FilterRule, LibRule, Packages},
   util::config::Config,
 };
+use std::env;
 use std::process::Command;
-use std::{collections::HashMap, path::Path};
+use std::sync::Arc;
+use std::{
+  collections::HashMap,
+  path::{Path, PathBuf},
+};
 
 pub use cargo::core::resolver::CliFeatures;
 
@@ -25,11 +33,14 @@ pub fn generate_rustc_flags(
   source_path: impl AsRef<Path>,
   features: CliFeatures,
   lib_only: bool,
-) -> Result<(Vec<String>, HashMap<String, String>)> {
+) -> Result<Vec<String>> {
   let source_path = source_path.as_ref();
 
+  let rustc = env::var_os("RUSTC")
+    .map(|s| s.into_string().unwrap())
+    .unwrap_or("rustc".to_string());
   let sysroot = String::from_utf8(
-    Command::new("rustc")
+    Command::new(rustc)
       .args(&["--print", "sysroot"])
       .output()?
       .stdout,
@@ -70,10 +81,6 @@ pub fn generate_rustc_flags(
     .flatten()
     .collect::<Vec<_>>();
 
-  // let mut queue = JobQueue::new(&bcx);
-  // let mut plan = BuildPlan::new();
-  // compile(&mut cx, &mut queue, &mut plan, target_unit, exec, false)?;
-
   let target_unit = {
     let matches = all_units
       .iter()
@@ -105,8 +112,8 @@ pub fn generate_rustc_flags(
   // TODO: generate these from build_base_args
   #[rustfmt::skip]
   let unit_flags = vec![
-    "rustc".into(),    
-    
+    "rustc".into(),
+
     "--crate-name".into(), target_unit.target.crate_name(),
 
     // TODO: what if there are multiple crate types?
@@ -135,37 +142,51 @@ pub fn generate_rustc_flags(
     .into_iter()
     .map(|s| s.into_string().unwrap());
 
-  let mut env = HashMap::new();
-  env.insert(
-    "CARGO_PKG_VERSION".into(),
-    target_unit.pkg.version().to_string(),
-  );
-  env.insert("CARGO_PKG_NAME".into(), target_unit.pkg.name().to_string());
-  env.insert(
-    "CARGO_MANIFEST_DIR".into(),
-    format!("{}", manifest_path.parent().unwrap().display()),
-  );
+  let pkg = &target_unit.pkg;
+  let mut env = vec![
+    ("CARGO_PKG_VERSION", pkg.version().to_string()),
+    ("CARGO_PKG_NAME", pkg.name().to_string()),
+    (
+      "CARGO_MANIFEST_DIR",
+      format!("{}", manifest_path.parent().unwrap().display()),
+    ),
+    ("CARGO_PKG_VERSION_MAJOR", pkg.version().major.to_string()),
+    ("CARGO_PKG_VERSION_MINOR", pkg.version().minor.to_string()),
+    ("CARGO_PKG_VERSION_PATCH", pkg.version().patch.to_string()),
+  ]
+  .into_iter()
+  .map(|(k, v)| (k.to_string(), v))
+  .collect::<HashMap<_, _>>();
 
-  // TODO: NOT WORKING
   if let Some(target_meta) = cx.find_build_script_metadata(target_unit) {
-    println!("A");
-    if let Some(output) = cx.build_script_outputs.lock().unwrap().get(target_meta) {
-      println!("B");
-      // for cfg in output.cfgs.iter() {
-      //   rustdoc.arg("--cfg").arg(cfg);
-      // }
-      for &(ref name, ref value) in output.env.iter() {
-        env.insert(name.to_owned(), value.to_owned());
-      }
-    }
+    let build_unit = cx.find_build_script_unit(target_unit).unwrap();
+    let mut queue = JobQueue::new(&bcx);
+    let mut plan = BuildPlan::new();
+    let exec = Arc::new(DefaultExecutor) as Arc<dyn Executor>;
+    compile(&mut cx, &mut queue, &mut plan, &build_unit, &exec, false)?;
+    queue.execute(&mut cx, &mut plan)?;
+
+    env.insert(
+      "OUT_DIR".into(),
+      format!("{}", cx.files().build_script_out_dir(&build_unit).display()),
+    );
+
+    let outputs = cx.build_script_outputs.lock().unwrap();
+    let output = outputs.get(target_meta).unwrap();
+    env.extend(output.env.clone().into_iter());
   }
 
-  Ok((
+  for (k, v) in env {
+    env::set_var(k, v);
+  }
+
+  //let workdir = source_path.parent().context("Parent 1")?.parent().context("Parent 2")?.to_owned();
+
+  Ok(
     unit_flags
       .into_iter()
       .chain(feature_flags)
       .chain(extern_flags)
       .collect(),
-    env,
-  ))
+  )
 }
