@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::{
   collections::HashMap,
-  path::{Path, PathBuf},
+  path::{Path},
 };
 
 pub use cargo::core::resolver::CliFeatures;
@@ -179,8 +179,6 @@ pub fn generate_rustc_flags(
   for (k, v) in env {
     env::set_var(k, v);
   }
-
-  //let workdir = source_path.parent().context("Parent 1")?.parent().context("Parent 2")?.to_owned();
 
   Ok(
     unit_flags
